@@ -1,0 +1,23 @@
+{
+  "repositories": [
+    {
+      "owner": "FrizzleM",
+      "name": "SideInstaller"
+    },
+    {
+      "owner": "FrizzleM",
+      "name": "Nightflix"
+    }
+  ],
+  "poll_interval": 900,
+  "max_versions": 50,
+  "output": "frizzlem.json",
+  "github_token": "",
+  "source": {
+    "name": "FrizzleM's AltSource",
+    "identifier": "com.frizzlem.altsource",
+    "iconURL": "https://avatars.githubusercontent.com/u/182496942",
+    "version": 1,
+    "apiVersion": "v1"
+  }
+}
