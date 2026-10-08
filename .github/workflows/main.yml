@@ -1,4 +1,3 @@
-
 name: Update AltSource
 
 on:
@@ -20,6 +19,7 @@ concurrency:
 jobs:
   update:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -29,8 +29,8 @@ jobs:
         with:
           node-version: 22
 
-      - name: Install IPA parsing libraries
-        run: npm install --prefix /tmp/altsource-deps adm-zip plist@3.1.0
+      - name: Install dependencies
+        run: npm install --prefix /tmp/altsource-deps adm-zip plist@3.1.0 bplist-parser
 
       - name: Generate AltSource
         env:
@@ -42,27 +42,26 @@ jobs:
           const path = require("path");
           const AdmZip = require("adm-zip");
           const plist = require("plist");
+          const bplist = require("bplist-parser");
 
           const API = "https://api.github.com";
-          const TOKEN = process.env.GITHUB_TOKEN;
           const OUTPUT = "frizzlem.json";
           const CACHE = ".frizzlem-cache.json";
+          const TOKEN = process.env.GITHUB_TOKEN;
 
-          function readJson(file, fallback) {
+          const readJson = (file, fallback) => {
             try {
               return JSON.parse(fs.readFileSync(file, "utf8"));
             } catch {
               return fallback;
             }
-          }
+          };
 
-          function writeJson(file, data) {
+          const writeJson = (file, data) =>
             fs.writeFileSync(file, JSON.stringify(data, null, 2) + "\n");
-          }
 
-          function repoKey(owner, name) {
-            return `${owner.toLowerCase()}/${name.toLowerCase()}`;
-          }
+          const repoKey = (owner, name) =>
+            `${owner.toLowerCase()}/${name.toLowerCase()}`;
 
           async function api(url) {
             const response = await fetch(url, {
@@ -75,9 +74,7 @@ jobs:
             });
 
             if (!response.ok) {
-              throw new Error(
-                `GitHub API ${response.status}: ${url}\n${await response.text()}`
-              );
+              throw new Error(`GitHub API returned ${response.status} for ${url}`);
             }
 
             return response.json();
@@ -86,35 +83,77 @@ jobs:
           async function download(url) {
             const response = await fetch(url);
             if (!response.ok) {
-              throw new Error(`Download failed (${response.status}): ${url}`);
+              throw new Error(`Download returned HTTP ${response.status}`);
             }
             return Buffer.from(await response.arrayBuffer());
           }
 
           function ipaAssets(release) {
-            return (release.assets || []).filter(
-              asset =>
-                asset.state === "uploaded" &&
-                asset.name.toLowerCase().endsWith(".ipa")
+            return (release.assets || []).filter(asset =>
+              asset.state === "uploaded" &&
+              asset.name.toLowerCase().endsWith(".ipa")
             );
           }
 
           function validReleases(releases) {
             return releases
-              .filter(r => !r.draft && !r.prerelease && ipaAssets(r).length)
+              .filter(release =>
+                !release.draft &&
+                !release.prerelease &&
+                ipaAssets(release).length > 0
+              )
               .sort((a, b) =>
-                (b.published_at || b.created_at || "")
-                  .localeCompare(a.published_at || a.created_at || "")
+                (b.published_at || b.created_at || "").localeCompare(
+                  a.published_at || a.created_at || ""
+                )
               );
           }
 
-          function versionOf(release) {
-            return (release.tag_name || release.name || "Unknown")
-              .replace(/^v/i, "");
+          const versionOf = release =>
+            (release.tag_name || release.name || "Unknown").replace(/^v/i, "");
+
+          const dateOf = release =>
+            release.published_at || release.created_at || "";
+
+          const releaseKey = release => ({
+            id: release.id,
+            tag: release.tag_name,
+            publishedAt: release.published_at,
+            createdAt: release.created_at
+          });
+
+          async function releaseSnapshot(owner, name) {
+            const pages = [];
+
+            for (let page = 1; ; page++) {
+              const releases = await api(
+                `${API}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/releases?per_page=100&page=${page}`
+              );
+
+              pages.push(releases);
+
+              if (validReleases(pages.flat()).length || releases.length < 100) {
+                break;
+              }
+            }
+
+            return {
+              pages,
+              latest: validReleases(pages.flat())[0] || null
+            };
           }
 
-          function dateOf(release) {
-            return release.published_at || release.created_at || "";
+          async function allReleases(owner, name, pages) {
+            for (let page = pages.length + 1; ; page++) {
+              const releases = await api(
+                `${API}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/releases?per_page=100&page=${page}`
+              );
+
+              pages.push(releases);
+              if (releases.length < 100) break;
+            }
+
+            return pages.flat();
           }
 
           function cleanMarkdown(text) {
@@ -135,13 +174,7 @@ jobs:
             for (const raw of readme.split(/\r?\n/)) {
               const line = raw.trim();
 
-              if (!line) {
-                if (current.length) paragraphs.push(current.join(" "));
-                current = [];
-                continue;
-              }
-
-              if (line.startsWith("#") || line.startsWith("![")) {
+              if (!line || line.startsWith("#") || line.startsWith("![")) {
                 if (current.length) paragraphs.push(current.join(" "));
                 current = [];
                 continue;
@@ -153,7 +186,7 @@ jobs:
 
             if (current.length) paragraphs.push(current.join(" "));
 
-            return paragraphs.find(p => p.length >= 20)?.slice(0, 4000) || "";
+            return paragraphs.find(text => text.length >= 20)?.slice(0, 4000) || "";
           }
 
           function readmeImages(readme) {
@@ -162,26 +195,37 @@ jobs:
               ...readme.matchAll(/<img[^>]+src=["'](https?:\/\/[^"']+)["']/gi)
             ];
 
-            return [...new Set(matches.map(m => m[1]).filter(url => {
+            return [...new Set(matches.map(match => match[1]).filter(url => {
               const lower = url.toLowerCase();
               return !lower.includes("shields.io") && !lower.includes("badge");
             }))];
           }
 
           async function readIpaInfo(url) {
-            const buffer = await download(url);
-            const zip = new AdmZip(buffer);
-
-            const entry = zip.getEntries().find(e =>
-              /^Payload\/[^/]+\.app\/Info\.plist$/.test(e.entryName)
+            const zip = new AdmZip(await download(url));
+            const entry = zip.getEntries().find(file =>
+              /^Payload\/[^/]+\.app\/Info\.plist$/.test(file.entryName)
             );
 
-            if (!entry) throw new Error("IPA does not contain an app Info.plist");
+            if (!entry) throw new Error("IPA is missing its app Info.plist");
 
-            const info = plist.parse(entry.getData().toString("utf8"));
+            const data = entry.getData();
+            let info;
+
+            if (data.subarray(0, 8).toString("ascii") === "bplist00") {
+              info = await new Promise((resolve, reject) => {
+                bplist.parseBuffer(data, (error, result) => {
+                  if (error) reject(error);
+                  else resolve(result[0]);
+                });
+              });
+            } else {
+              info = plist.parse(data.toString("utf8"));
+            }
+
             const primary = info.CFBundleIcons?.CFBundlePrimaryIcon || {};
-
             let iconFiles = primary.CFBundleIconFiles || [];
+
             if (typeof iconFiles === "string") iconFiles = [iconFiles];
 
             return {
@@ -193,8 +237,11 @@ jobs:
 
           function iconSize(image) {
             const match = String(image.size || "").match(/([\d.]+)\s*[x×]\s*([\d.]+)/);
-            if (!match) return 0;
-            return Number(match[1]) * Number(match[2]);
+            return match ? Number(match[1]) * Number(match[2]) : 0;
+          }
+
+          function rawUrl(owner, name, branch, file) {
+            return `https://raw.githubusercontent.com/${owner}/${name}/${encodeURIComponent(branch)}/${file.split("/").map(encodeURIComponent).join("/")}`;
           }
 
           async function findIcon(owner, name, branch, ipaInfo) {
@@ -202,15 +249,16 @@ jobs:
             const treeData = await api(
               `${repo}/git/trees/${encodeURIComponent(branch)}?recursive=1`
             );
-
             const tree = treeData.tree || [];
-            const sets = tree.filter(e =>
-              e.type === "tree" && e.path.toLowerCase().endsWith(".appiconset")
+
+            const sets = tree.filter(file =>
+              file.type === "tree" &&
+              file.path.toLowerCase().endsWith(".appiconset")
             );
 
-            let selectedSet = sets.find(e =>
-              path.posix.basename(e.path, ".appiconset").toLowerCase() ===
-              ipaInfo.iconName.toLowerCase()
+            const iconName = ipaInfo.iconName.toLowerCase();
+            const selectedSet = sets.find(file =>
+              path.posix.basename(file.path).replace(/\.appiconset$/i, "").toLowerCase() === iconName
             );
 
             if (selectedSet) {
@@ -218,7 +266,6 @@ jobs:
               const contentsData = await api(
                 `${repo}/contents/${contentsPath.split("/").map(encodeURIComponent).join("/")}?ref=${encodeURIComponent(branch)}`
               );
-
               const contents = JSON.parse(
                 Buffer.from(contentsData.content, "base64").toString("utf8")
               );
@@ -226,42 +273,42 @@ jobs:
               const candidates = (contents.images || [])
                 .filter(image =>
                   image.filename &&
-                  !(image.appearances || []).some(a =>
-                    a.appearance === "luminosity"
+                  !(image.appearances || []).some(appearance =>
+                    appearance.appearance === "luminosity"
                   )
                 )
-                .sort((a, b) => {
-                  const sizeDifference = iconSize(b) - iconSize(a);
-                  if (sizeDifference) return sizeDifference;
-
-                  const scale = value =>
-                    Number(String(value.scale || "").replace("x", "")) || 0;
-
-                  return scale(b) - scale(a);
-                });
+                .sort((a, b) =>
+                  iconSize(b) - iconSize(a) ||
+                  (Number(String(b.scale || "").replace("x", "")) || 0) -
+                  (Number(String(a.scale || "").replace("x", "")) || 0)
+                );
 
               if (candidates.length) {
-                const file = `${selectedSet.path}/${candidates[0].filename}`;
-                return `https://raw.githubusercontent.com/${owner}/${name}/${encodeURIComponent(branch)}/${file.split("/").map(encodeURIComponent).join("/")}`;
+                return rawUrl(
+                  owner,
+                  name,
+                  branch,
+                  `${selectedSet.path}/${candidates[0].filename}`
+                );
               }
             }
 
-            for (const iconFile of ipaInfo.iconFiles || []) {
+            for (const iconFile of ipaInfo.iconFiles) {
               const filename = path.posix.basename(iconFile);
-              const found = tree.find(e =>
-                e.type === "blob" &&
-                path.posix.basename(e.path).toLowerCase() === filename.toLowerCase()
+              const found = tree.find(file =>
+                file.type === "blob" &&
+                path.posix.basename(file.path).toLowerCase() === filename.toLowerCase()
               );
 
-              if (found) {
-                return `https://raw.githubusercontent.com/${owner}/${name}/${encodeURIComponent(branch)}/${found.path.split("/").map(encodeURIComponent).join("/")}`;
-              }
+              if (found) return rawUrl(owner, name, branch, found.path);
             }
 
             return "";
           }
 
-          function versionEntry(release, asset) {
+          function versionEntry(release) {
+            const asset = ipaAssets(release)[0];
+
             return {
               version: versionOf(release),
               date: dateOf(release),
@@ -271,34 +318,34 @@ jobs:
             };
           }
 
-          function latestDownloadUrl(owner, name, assetName) {
-            return `https://github.com/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/releases/latest/download/${encodeURIComponent(assetName)}`;
-          }
-
           async function buildApp(owner, name, repository, releases, maxVersions) {
             const qualifying = validReleases(releases).slice(0, maxVersions);
             if (!qualifying.length) return null;
 
-            const [latest, latestAsset] = [qualifying[0], ipaAssets(qualifying[0])[0]];
+            const latest = qualifying[0];
+            const latestAsset = ipaAssets(latest)[0];
             const ipaInfo = await readIpaInfo(latestAsset.browser_download_url);
 
             if (!ipaInfo.bundleIdentifier) {
-              throw new Error("Could not determine bundle identifier from IPA");
+              throw new Error("Could not read the app bundle identifier");
             }
 
             let readme = "";
+
             try {
               const result = await api(
                 `${API}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/readme`
               );
+
               if (result.encoding === "base64") {
                 readme = Buffer.from(result.content, "base64").toString("utf8");
               }
-            } catch (error) {
-              console.log(`README unavailable: ${error.message}`);
+            } catch {
+              console.log(`  README unavailable`);
             }
 
             let iconURL = "";
+
             try {
               iconURL = await findIcon(
                 owner,
@@ -306,16 +353,12 @@ jobs:
                 repository.default_branch || "main",
                 ipaInfo
               );
-            } catch (error) {
-              console.log(`Icon lookup failed: ${error.message}`);
+            } catch {
+              console.log(`  Icon unavailable`);
             }
 
-            const versions = qualifying.map(release =>
-              versionEntry(release, ipaAssets(release)[0])
-            );
-
+            const versions = qualifying.map(versionEntry);
             const description = (repository.description || "").trim() || name;
-            const localizedDescription = readmeDescription(readme) || description;
 
             const app = {
               bundleIdentifier: ipaInfo.bundleIdentifier,
@@ -323,11 +366,11 @@ jobs:
               developerName: owner,
               iconURL,
               subtitle: description,
-              localizedDescription,
+              localizedDescription: readmeDescription(readme) || description,
               version: versions[0].version,
               versionDate: versions[0].date,
               versionDescription: versions[0].localizedDescription,
-              downloadURL: latestDownloadUrl(owner, name, latestAsset.name),
+              downloadURL: `https://github.com/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/releases/latest/download/${encodeURIComponent(latestAsset.name)}`,
               size: latestAsset.size || 0,
               versions
             };
@@ -335,40 +378,28 @@ jobs:
             const screenshots = readmeImages(readme);
             if (screenshots.length) app.screenshotURLs = screenshots;
 
-            return {
-              releaseKey: {
-                id: latest.id,
-                tag: latest.tag_name,
-                publishedAt: latest.published_at,
-                createdAt: latest.created_at
-              },
-              app
-            };
-          }
-
-          async function allReleases(owner, name) {
-            const releases = [];
-            for (let page = 1; ; page++) {
-              const data = await api(
-                `${API}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/releases?per_page=100&page=${page}`
-              );
-
-              releases.push(...data);
-              if (data.length < 100) break;
-            }
-            return releases;
+            return { releaseKey: releaseKey(latest), app };
           }
 
           async function main() {
             const config = readJson("config.json", null);
             if (!config) throw new Error("config.json is missing or invalid");
 
+            const sourceConfig = config.source || {};
             const output = config.output || OUTPUT;
             const cache = readJson(CACHE, { repositories: {} });
+
             if (!cache.repositories) cache.repositories = {};
 
-            const previousSource = readJson(output, {});
-            const sourceConfig = config.source || {};
+            const repositories = config.repositories || [];
+            const maxVersions = Math.max(1, Number(config.max_versions) || 50);
+            const configuredKeys = new Set(
+              repositories.map(item => repoKey(item.owner || "", item.name || ""))
+            );
+
+            for (const key of Object.keys(cache.repositories)) {
+              if (!configuredKeys.has(key)) delete cache.repositories[key];
+            }
 
             const source = {
               name: sourceConfig.name,
@@ -379,20 +410,14 @@ jobs:
               apiVersion: sourceConfig.apiVersion ?? "v1"
             };
 
-            const repositories = config.repositories || [];
-            const maxVersions = Math.max(1, Number(config.max_versions || 50));
-            const currentKeys = new Set(
-              repositories.map(r => repoKey(r.owner, r.name))
-            );
-
-            for (const key of Object.keys(cache.repositories)) {
-              if (!currentKeys.has(key)) delete cache.repositories[key];
-            }
-
             for (const item of repositories) {
               const owner = String(item.owner || "").trim();
               const name = String(item.name || "").trim();
-              if (!owner || !name) continue;
+
+              if (!owner || !name) {
+                console.log("Skipping repository with missing owner or name");
+                continue;
+              }
 
               const key = repoKey(owner, name);
               const cached = cache.repositories[key];
@@ -400,46 +425,35 @@ jobs:
               console.log(`Checking ${owner}/${name}`);
 
               try {
+                const snapshot = await releaseSnapshot(owner, name);
+
+                if (!snapshot.latest) {
+                  if (cached?.app) {
+                    source.apps.push(cached.app);
+                    console.log("  No eligible IPA release; using cache");
+                  } else {
+                    console.log("  No published IPA releases found");
+                  }
+                  continue;
+                }
+
+                const latestKey = releaseKey(snapshot.latest);
+                const unchanged =
+                  cached?.app &&
+                  JSON.stringify(cached.releaseKey) === JSON.stringify(latestKey) &&
+                  Number(cached.maxVersions) === maxVersions;
+
+                if (unchanged) {
+                  source.apps.push(cached.app);
+                  console.log(`  Unchanged: ${cached.app.version}`);
+                  continue;
+                }
+
+                const releases = await allReleases(owner, name, snapshot.pages);
                 const repository = await api(
                   `${API}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(name)}`
                 );
 
-                let latest;
-                try {
-                  latest = await api(
-                    `${API}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/releases/latest`
-                  );
-                } catch (error) {
-                  if (cached?.app) {
-                    console.log(`Latest release unavailable; retaining cache: ${error.message}`);
-                    source.apps.push(cached.app);
-                    continue;
-                  }
-                  throw error;
-                }
-
-                const latestKey = {
-                  id: latest.id,
-                  tag: latest.tag_name,
-                  publishedAt: latest.published_at,
-                  createdAt: latest.created_at
-                };
-
-                const unchanged =
-                  cached?.releaseKey &&
-                  JSON.stringify(cached.releaseKey) === JSON.stringify(latestKey) &&
-                  cached.app &&
-                  Number(cached.maxVersions) === maxVersions;
-
-                if (unchanged) {
-                  console.log("Release unchanged; using cached app.");
-                  source.apps.push(cached.app);
-                  continue;
-                }
-
-                console.log("Release changed or cache missing; rebuilding app.");
-
-                const releases = await allReleases(owner, name);
                 const built = await buildApp(
                   owner,
                   name,
@@ -448,31 +462,37 @@ jobs:
                   maxVersions
                 );
 
-                if (built) {
-                  cache.repositories[key] = {
-                    ...built,
-                    maxVersions
-                  };
-                  source.apps.push(built.app);
-                } else if (cached?.app) {
-                  source.apps.push(cached.app);
-                } else {
-                  console.log("No published IPA releases found.");
-                }
+                if (!built) throw new Error("No eligible IPA releases found");
+
+                cache.repositories[key] = {
+                  ...built,
+                  maxVersions
+                };
+
+                source.apps.push(built.app);
+                console.log(`  Updated: ${built.app.version} (${built.app.versions.length} versions)`);
               } catch (error) {
-                console.error(`Failed ${owner}/${name}: ${error.message}`);
-                if (cached?.app) source.apps.push(cached.app);
+                console.error(`  Failed: ${error.message}`);
+
+                if (cached?.app) {
+                  source.apps.push(cached.app);
+                  console.log("  Using cached app");
+                }
               }
+            }
+
+            if (repositories.length && !source.apps.length) {
+              throw new Error("No apps could be generated. See repository errors above.");
             }
 
             writeJson(output, source);
             writeJson(CACHE, cache);
 
-            console.log(`Generated ${output} with ${source.apps.length} app(s).`);
+            console.log(`Finished: ${source.apps.length} app(s) in ${output}`);
           }
 
           main().catch(error => {
-            console.error(error);
+            console.error(error.message);
             process.exitCode = 1;
           });
           NODE
@@ -481,10 +501,12 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add frizzlem.json .frizzlem-cache.json
+          git add -- frizzlem.json .frizzlem-cache.json
+
           if git diff --cached --quiet; then
             echo "No changes to commit."
             exit 0
           fi
+
           git commit -m "Update AltSource"
           git push
