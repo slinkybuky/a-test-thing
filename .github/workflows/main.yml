@@ -30,7 +30,7 @@ jobs:
           node-version: 22
 
       - name: Install IPA parsing libraries
-        run: npm install --prefix /tmp/altsource-deps adm-zip plist
+        run: npm install --prefix /tmp/altsource-deps adm-zip plist@3.1.0
 
       - name: Generate AltSource
         env:
