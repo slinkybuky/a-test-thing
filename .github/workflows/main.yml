@@ -30,7 +30,7 @@ jobs:
           node-version: 22
 
       - name: Install dependencies
-        run: npm install --prefix /tmp/altsource-deps adm-zip plist@3.1.0 bplist-parser
+        run: npm install --prefix /tmp/altsource-deps adm-zip plist@3.1.0 bplist-parser@0.2.0
 
       - name: Generate AltSource
         env:
