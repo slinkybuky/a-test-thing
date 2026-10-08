@@ -1,3 +1,4 @@
+
 name: Update AltSource
 
 on:
@@ -19,6 +20,7 @@ concurrency:
 jobs:
   update:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
 
     steps:
       - name: Checkout repository
@@ -30,7 +32,7 @@ jobs:
           node-version: 22
 
       - name: Install dependencies
-        run: npm install --prefix /tmp/altsource-deps adm-zip plist@3.1.0 bplist-parser@0.2.0
+        run: npm install --prefix /tmp/altsource-deps adm-zip plist@3.1.0
 
       - name: Generate AltSource
         env:
@@ -40,13 +42,12 @@ jobs:
           node <<'NODE'
           const fs = require("fs");
           const path = require("path");
+          const { execFileSync } = require("child_process");
           const AdmZip = require("adm-zip");
           const plist = require("plist");
-          const bplist = require("bplist-parser");
 
           const API = "https://api.github.com";
-          const OUTPUT = "frizzlem.json";
-          const CACHE = ".frizzlem-cache.json";
+          const CACHE_FILE = ".frizzlem-cache.json";
           const TOKEN = process.env.GITHUB_TOKEN;
 
           const readJson = (file, fallback) => {
@@ -57,34 +58,52 @@ jobs:
             }
           };
 
-          const writeJson = (file, data) =>
-            fs.writeFileSync(file, JSON.stringify(data, null, 2) + "\n");
+          const writeJson = (file, value) => {
+            fs.writeFileSync(file, JSON.stringify(value, null, 2) + "\n");
+          };
 
           const repoKey = (owner, name) =>
             `${owner.toLowerCase()}/${name.toLowerCase()}`;
 
-          async function api(url) {
+          async function request(url, options = {}) {
+            console.log(`  Request: ${url}`);
+
             const response = await fetch(url, {
+              ...options,
+              signal: AbortSignal.timeout(options.timeout || 60000),
               headers: {
                 Accept: "application/vnd.github+json",
                 Authorization: `Bearer ${TOKEN}`,
                 "X-GitHub-Api-Version": "2022-11-28",
-                "User-Agent": "AltSource-Generator"
+                "User-Agent": "Frizzlem-AltSource",
+                ...options.headers
               }
             });
 
             if (!response.ok) {
-              throw new Error(`GitHub API returned ${response.status} for ${url}`);
+              const body = (await response.text()).slice(0, 500);
+              throw new Error(
+                `HTTP ${response.status} for ${url}\n${body}`
+              );
             }
 
-            return response.json();
+            return response;
+          }
+
+          async function api(url) {
+            return (await request(url)).json();
           }
 
           async function download(url) {
-            const response = await fetch(url);
-            if (!response.ok) {
-              throw new Error(`Download returned HTTP ${response.status}`);
-            }
+            const response = await request(url, {
+              timeout: 180000,
+              headers: {
+                Accept: "*/*",
+                Authorization: undefined,
+                "X-GitHub-Api-Version": undefined
+              }
+            });
+
             return Buffer.from(await response.arrayBuffer());
           }
 
@@ -122,38 +141,21 @@ jobs:
             createdAt: release.created_at
           });
 
-          async function releaseSnapshot(owner, name) {
-            const pages = [];
+          async function allReleases(owner, name) {
+            const result = [];
 
             for (let page = 1; ; page++) {
               const releases = await api(
                 `${API}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/releases?per_page=100&page=${page}`
               );
 
-              pages.push(releases);
+              result.push(...releases);
+              console.log(`  Releases page ${page}: ${releases.length}`);
 
-              if (validReleases(pages.flat()).length || releases.length < 100) {
-                break;
-              }
-            }
-
-            return {
-              pages,
-              latest: validReleases(pages.flat())[0] || null
-            };
-          }
-
-          async function allReleases(owner, name, pages) {
-            for (let page = pages.length + 1; ; page++) {
-              const releases = await api(
-                `${API}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/releases?per_page=100&page=${page}`
-              );
-
-              pages.push(releases);
               if (releases.length < 100) break;
             }
 
-            return pages.flat();
+            return result;
           }
 
           function cleanMarkdown(text) {
@@ -174,7 +176,12 @@ jobs:
             for (const raw of readme.split(/\r?\n/)) {
               const line = raw.trim();
 
-              if (!line || line.startsWith("#") || line.startsWith("![")) {
+              if (
+                !line ||
+                line.startsWith("#") ||
+                line.startsWith("![") ||
+                line.startsWith("<img")
+              ) {
                 if (current.length) paragraphs.push(current.join(" "));
                 current = [];
                 continue;
@@ -186,7 +193,7 @@ jobs:
 
             if (current.length) paragraphs.push(current.join(" "));
 
-            return paragraphs.find(text => text.length >= 20)?.slice(0, 4000) || "";
+            return paragraphs.find(value => value.length >= 20)?.slice(0, 4000) || "";
           }
 
           function readmeImages(readme) {
@@ -201,38 +208,69 @@ jobs:
             }))];
           }
 
-          async function readIpaInfo(url) {
-            const zip = new AdmZip(await download(url));
+          function readIpaInfo(url) {
+            console.log("  Downloading IPA and reading its Info.plist...");
+            const zip = new AdmZip(downloadSync(url));
             const entry = zip.getEntries().find(file =>
               /^Payload\/[^/]+\.app\/Info\.plist$/.test(file.entryName)
             );
 
-            if (!entry) throw new Error("IPA is missing its app Info.plist");
-
-            const data = entry.getData();
-            let info;
-
-            if (data.subarray(0, 8).toString("ascii") === "bplist00") {
-              info = await new Promise((resolve, reject) => {
-                bplist.parseBuffer(data, (error, result) => {
-                  if (error) reject(error);
-                  else resolve(result[0]);
-                });
-              });
-            } else {
-              info = plist.parse(data.toString("utf8"));
+            if (!entry) {
+              throw new Error("IPA does not contain Payload/<app>.app/Info.plist");
             }
 
-            const primary = info.CFBundleIcons?.CFBundlePrimaryIcon || {};
-            let iconFiles = primary.CFBundleIconFiles || [];
+            const data = entry.getData();
 
-            if (typeof iconFiles === "string") iconFiles = [iconFiles];
+            // Python's standard library supports both binary and XML plists.
+            const python = [
+              "import base64, json, plistlib, sys",
+              "p = plistlib.loads(base64.b64decode(sys.argv[1]))",
+              "icons = p.get('CFBundleIcons', {}).get('CFBundlePrimaryIcon', {})",
+              "print(json.dumps({",
+              " 'bundleIdentifier': p.get('CFBundleIdentifier', ''),",
+              " 'iconName': p.get('CFBundleIconName', icons.get('CFBundleIconName', '')),",
+              " 'iconFiles': icons.get('CFBundleIconFiles', [])",
+              "}))"
+            ].join("\n");
 
-            return {
-              bundleIdentifier: info.CFBundleIdentifier || "",
-              iconName: info.CFBundleIconName || primary.CFBundleIconName || "",
-              iconFiles
-            };
+            const result = execFileSync(
+              "python3",
+              ["-c", python, data.toString("base64")],
+              { encoding: "utf8", timeout: 15000 }
+            );
+
+            const info = JSON.parse(result);
+            if (!info.bundleIdentifier) {
+              throw new Error("Info.plist has no CFBundleIdentifier");
+            }
+
+            if (typeof info.iconFiles === "string") {
+              info.iconFiles = [info.iconFiles];
+            }
+
+            return info;
+          }
+
+          // Download synchronously with a bounded timeout to keep ZIP parsing simple.
+          function downloadSync(url) {
+            const script = [
+              "import sys, urllib.request",
+              "r = urllib.request.Request(sys.argv[1], headers={'User-Agent':'Frizzlem-AltSource'})",
+              "with urllib.request.urlopen(r, timeout=180) as response:",
+              " sys.stdout.buffer.write(response.read())"
+            ].join("\n");
+
+            return execFileSync("python3", ["-c", script, url], {
+              encoding: "buffer",
+              timeout: 210000,
+              maxBuffer: 1024 * 1024 * 1024
+            });
+          }
+
+          function rawUrl(owner, name, branch, file) {
+            const branchPath = branch.split("/").map(encodeURIComponent).join("/");
+            const filePath = file.split("/").map(encodeURIComponent).join("/");
+            return `https://raw.githubusercontent.com/${owner}/${name}/${branchPath}/${filePath}`;
           }
 
           function iconSize(image) {
@@ -240,25 +278,23 @@ jobs:
             return match ? Number(match[1]) * Number(match[2]) : 0;
           }
 
-          function rawUrl(owner, name, branch, file) {
-            return `https://raw.githubusercontent.com/${owner}/${name}/${encodeURIComponent(branch)}/${file.split("/").map(encodeURIComponent).join("/")}`;
-          }
-
           async function findIcon(owner, name, branch, ipaInfo) {
             const repo = `${API}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(name)}`;
             const treeData = await api(
-              `${repo}/git/trees/${encodeURIComponent(branch)}?recursive=1`
+              `${repo}/git/trees/${branch.split("/").map(encodeURIComponent).join("/")}?recursive=1`
             );
             const tree = treeData.tree || [];
+            const iconName = (ipaInfo.iconName || "").toLowerCase();
 
             const sets = tree.filter(file =>
               file.type === "tree" &&
               file.path.toLowerCase().endsWith(".appiconset")
             );
 
-            const iconName = ipaInfo.iconName.toLowerCase();
             const selectedSet = sets.find(file =>
-              path.posix.basename(file.path).replace(/\.appiconset$/i, "").toLowerCase() === iconName
+              path.posix.basename(file.path)
+                .replace(/\.appiconset$/i, "")
+                .toLowerCase() === iconName
             );
 
             if (selectedSet) {
@@ -266,6 +302,7 @@ jobs:
               const contentsData = await api(
                 `${repo}/contents/${contentsPath.split("/").map(encodeURIComponent).join("/")}?ref=${encodeURIComponent(branch)}`
               );
+
               const contents = JSON.parse(
                 Buffer.from(contentsData.content, "base64").toString("utf8")
               );
@@ -285,15 +322,13 @@ jobs:
 
               if (candidates.length) {
                 return rawUrl(
-                  owner,
-                  name,
-                  branch,
+                  owner, name, branch,
                   `${selectedSet.path}/${candidates[0].filename}`
                 );
               }
             }
 
-            for (const iconFile of ipaInfo.iconFiles) {
+            for (const iconFile of ipaInfo.iconFiles || []) {
               const filename = path.posix.basename(iconFile);
               const found = tree.find(file =>
                 file.type === "blob" &&
@@ -320,15 +355,13 @@ jobs:
 
           async function buildApp(owner, name, repository, releases, maxVersions) {
             const qualifying = validReleases(releases).slice(0, maxVersions);
-            if (!qualifying.length) return null;
+            if (!qualifying.length) {
+              throw new Error("No published, non-prerelease release with an IPA asset was found");
+            }
 
             const latest = qualifying[0];
             const latestAsset = ipaAssets(latest)[0];
-            const ipaInfo = await readIpaInfo(latestAsset.browser_download_url);
-
-            if (!ipaInfo.bundleIdentifier) {
-              throw new Error("Could not read the app bundle identifier");
-            }
+            const ipaInfo = readIpaInfo(latestAsset.browser_download_url);
 
             let readme = "";
 
@@ -340,8 +373,8 @@ jobs:
               if (result.encoding === "base64") {
                 readme = Buffer.from(result.content, "base64").toString("utf8");
               }
-            } catch {
-              console.log(`  README unavailable`);
+            } catch (error) {
+              console.log(`  README unavailable: ${error.message}`);
             }
 
             let iconURL = "";
@@ -353,8 +386,8 @@ jobs:
                 repository.default_branch || "main",
                 ipaInfo
               );
-            } catch {
-              console.log(`  Icon unavailable`);
+            } catch (error) {
+              console.log(`  Icon lookup failed: ${error.message}`);
             }
 
             const versions = qualifying.map(versionEntry);
@@ -370,7 +403,7 @@ jobs:
               version: versions[0].version,
               versionDate: versions[0].date,
               versionDescription: versions[0].localizedDescription,
-              downloadURL: `https://github.com/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/releases/latest/download/${encodeURIComponent(latestAsset.name)}`,
+              downloadURL: `https://github.com/${owner}/${name}/releases/latest/download/${encodeURIComponent(latestAsset.name)}`,
               size: latestAsset.size || 0,
               versions
             };
@@ -385,16 +418,21 @@ jobs:
             const config = readJson("config.json", null);
             if (!config) throw new Error("config.json is missing or invalid");
 
+            if (!Array.isArray(config.repositories) || !config.repositories.length) {
+              throw new Error("config.json must contain a non-empty repositories array");
+            }
+
             const sourceConfig = config.source || {};
-            const output = config.output || OUTPUT;
-            const cache = readJson(CACHE, { repositories: {} });
+            const output = config.output || "frizzlem.json";
+            const maxVersions = Math.max(1, Number(config.max_versions) || 50);
+            const cache = readJson(CACHE_FILE, { repositories: {} });
 
             if (!cache.repositories) cache.repositories = {};
 
-            const repositories = config.repositories || [];
-            const maxVersions = Math.max(1, Number(config.max_versions) || 50);
             const configuredKeys = new Set(
-              repositories.map(item => repoKey(item.owner || "", item.name || ""))
+              config.repositories.map(item =>
+                repoKey(item.owner || "", item.name || "")
+              )
             );
 
             for (const key of Object.keys(cache.repositories)) {
@@ -402,42 +440,39 @@ jobs:
             }
 
             const source = {
-              name: sourceConfig.name,
-              identifier: sourceConfig.identifier,
-              iconURL: sourceConfig.iconURL,
+              name: sourceConfig.name || "AltSource",
+              identifier: sourceConfig.identifier || "com.example.altsource",
+              iconURL: sourceConfig.iconURL || "",
               apps: [],
               version: sourceConfig.version ?? 1,
               apiVersion: sourceConfig.apiVersion ?? "v1"
             };
 
-            for (const item of repositories) {
+            const failures = [];
+
+            for (const item of config.repositories) {
               const owner = String(item.owner || "").trim();
               const name = String(item.name || "").trim();
 
               if (!owner || !name) {
-                console.log("Skipping repository with missing owner or name");
+                failures.push("A repository is missing its owner or name");
                 continue;
               }
 
               const key = repoKey(owner, name);
               const cached = cache.repositories[key];
 
-              console.log(`Checking ${owner}/${name}`);
+              console.log(`\nChecking ${owner}/${name}`);
 
               try {
-                const snapshot = await releaseSnapshot(owner, name);
+                const releases = await allReleases(owner, name);
+                const qualifying = validReleases(releases);
 
-                if (!snapshot.latest) {
-                  if (cached?.app) {
-                    source.apps.push(cached.app);
-                    console.log("  No eligible IPA release; using cache");
-                  } else {
-                    console.log("  No published IPA releases found");
-                  }
-                  continue;
+                if (!qualifying.length) {
+                  throw new Error("No eligible published IPA releases found");
                 }
 
-                const latestKey = releaseKey(snapshot.latest);
+                const latestKey = releaseKey(qualifying[0]);
                 const unchanged =
                   cached?.app &&
                   JSON.stringify(cached.releaseKey) === JSON.stringify(latestKey) &&
@@ -449,20 +484,13 @@ jobs:
                   continue;
                 }
 
-                const releases = await allReleases(owner, name, snapshot.pages);
                 const repository = await api(
                   `${API}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(name)}`
                 );
 
                 const built = await buildApp(
-                  owner,
-                  name,
-                  repository,
-                  releases,
-                  maxVersions
+                  owner, name, repository, releases, maxVersions
                 );
-
-                if (!built) throw new Error("No eligible IPA releases found");
 
                 cache.repositories[key] = {
                   ...built,
@@ -470,38 +498,79 @@ jobs:
                 };
 
                 source.apps.push(built.app);
-                console.log(`  Updated: ${built.app.version} (${built.app.versions.length} versions)`);
+                console.log(`  Updated: ${built.app.version}`);
               } catch (error) {
-                console.error(`  Failed: ${error.message}`);
+                console.error(`  ERROR for ${owner}/${name}: ${error.stack || error}`);
 
                 if (cached?.app) {
                   source.apps.push(cached.app);
-                  console.log("  Using cached app");
+                  console.log("  Keeping previously cached app.");
+                } else {
+                  failures.push(`${owner}/${name}: ${error.message}`);
                 }
               }
             }
 
-            if (repositories.length && !source.apps.length) {
-              throw new Error("No apps could be generated. See repository errors above.");
+            if (!source.apps.length || failures.length) {
+              throw new Error(
+                `AltSource not written. ${source.apps.length} app(s) built; ` +
+                `${failures.length} repository failure(s).\n` +
+                failures.join("\n")
+              );
             }
 
             writeJson(output, source);
-            writeJson(CACHE, cache);
+            writeJson(CACHE_FILE, cache);
 
-            console.log(`Finished: ${source.apps.length} app(s) in ${output}`);
+            console.log(`\nSUCCESS: generated ${source.apps.length} app(s) in ${output}`);
           }
 
           main().catch(error => {
-            console.error(error.message);
-            process.exitCode = 1;
+            console.error(`\nFATAL: ${error.stack || error}`);
+            process.exit(1);
           });
           NODE
 
-      - name: Commit changes
+      - name: Validate AltSource
         run: |
+          python3 - <<'PY'
+          import json
+          import os
+
+          with open("config.json", encoding="utf-8") as file:
+              config = json.load(file)
+
+          output = config.get("output") or "frizzlem.json"
+
+          if not os.path.isfile(output):
+              raise SystemExit(f"ERROR: {output} was not created")
+
+          with open(output, encoding="utf-8") as file:
+              source = json.load(file)
+
+          apps = source.get("apps")
+          if not isinstance(apps, list) or not apps:
+              raise SystemExit("ERROR: AltSource has no apps; refusing to publish it")
+
+          for app in apps:
+              for field in ("name", "bundleIdentifier", "version", "downloadURL"):
+                  if not app.get(field):
+                      raise SystemExit(
+                          f"ERROR: {app.get('name', 'Unknown app')} is missing {field}"
+                      )
+
+          print(f"Validated {len(apps)} app(s) in {output}")
+          PY
+
+      - name: Commit changes
+        env:
+          OUTPUT: ${{ vars.ALTSOURCE_OUTPUT }}
+        run: |
+          OUTPUT="${OUTPUT:-frizzlem.json}"
+
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -- frizzlem.json .frizzlem-cache.json
+          git add -- "$OUTPUT" .frizzlem-cache.json
 
           if git diff --cached --quiet; then
             echo "No changes to commit."
