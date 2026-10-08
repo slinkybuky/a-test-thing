@@ -1,0 +1,490 @@
+
+name: Update AltSource
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+  push:
+    paths:
+      - config.json
+      - .github/workflows/update.yml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: altsource-update
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install IPA parsing libraries
+        run: npm install --prefix /tmp/altsource-deps adm-zip plist
+
+      - name: Generate AltSource
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          NODE_PATH: /tmp/altsource-deps/node_modules
+        run: |
+          node <<'NODE'
+          const fs = require("fs");
+          const path = require("path");
+          const AdmZip = require("adm-zip");
+          const plist = require("plist");
+
+          const API = "https://api.github.com";
+          const TOKEN = process.env.GITHUB_TOKEN;
+          const OUTPUT = "frizzlem.json";
+          const CACHE = ".frizzlem-cache.json";
+
+          function readJson(file, fallback) {
+            try {
+              return JSON.parse(fs.readFileSync(file, "utf8"));
+            } catch {
+              return fallback;
+            }
+          }
+
+          function writeJson(file, data) {
+            fs.writeFileSync(file, JSON.stringify(data, null, 2) + "\n");
+          }
+
+          function repoKey(owner, name) {
+            return `${owner.toLowerCase()}/${name.toLowerCase()}`;
+          }
+
+          async function api(url) {
+            const response = await fetch(url, {
+              headers: {
+                Accept: "application/vnd.github+json",
+                Authorization: `Bearer ${TOKEN}`,
+                "X-GitHub-Api-Version": "2022-11-28",
+                "User-Agent": "AltSource-Generator"
+              }
+            });
+
+            if (!response.ok) {
+              throw new Error(
+                `GitHub API ${response.status}: ${url}\n${await response.text()}`
+              );
+            }
+
+            return response.json();
+          }
+
+          async function download(url) {
+            const response = await fetch(url);
+            if (!response.ok) {
+              throw new Error(`Download failed (${response.status}): ${url}`);
+            }
+            return Buffer.from(await response.arrayBuffer());
+          }
+
+          function ipaAssets(release) {
+            return (release.assets || []).filter(
+              asset =>
+                asset.state === "uploaded" &&
+                asset.name.toLowerCase().endsWith(".ipa")
+            );
+          }
+
+          function validReleases(releases) {
+            return releases
+              .filter(r => !r.draft && !r.prerelease && ipaAssets(r).length)
+              .sort((a, b) =>
+                (b.published_at || b.created_at || "")
+                  .localeCompare(a.published_at || a.created_at || "")
+              );
+          }
+
+          function versionOf(release) {
+            return (release.tag_name || release.name || "Unknown")
+              .replace(/^v/i, "");
+          }
+
+          function dateOf(release) {
+            return release.published_at || release.created_at || "";
+          }
+
+          function cleanMarkdown(text) {
+            return text
+              .replace(/!\[[^\]]*\]\([^)]*\)/g, "")
+              .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1")
+              .replace(/<[^>]+>/g, "")
+              .replace(/`{1,3}[^`]*`{1,3}/g, "")
+              .replace(/[*_~>#]/g, "")
+              .replace(/\s+/g, " ")
+              .trim();
+          }
+
+          function readmeDescription(readme) {
+            const paragraphs = [];
+            let current = [];
+
+            for (const raw of readme.split(/\r?\n/)) {
+              const line = raw.trim();
+
+              if (!line) {
+                if (current.length) paragraphs.push(current.join(" "));
+                current = [];
+                continue;
+              }
+
+              if (line.startsWith("#") || line.startsWith("![")) {
+                if (current.length) paragraphs.push(current.join(" "));
+                current = [];
+                continue;
+              }
+
+              const cleaned = cleanMarkdown(line);
+              if (cleaned) current.push(cleaned);
+            }
+
+            if (current.length) paragraphs.push(current.join(" "));
+
+            return paragraphs.find(p => p.length >= 20)?.slice(0, 4000) || "";
+          }
+
+          function readmeImages(readme) {
+            const matches = [
+              ...readme.matchAll(/!\[[^\]]*\]\((https?:\/\/[^)\s]+)[^)]*\)/g),
+              ...readme.matchAll(/<img[^>]+src=["'](https?:\/\/[^"']+)["']/gi)
+            ];
+
+            return [...new Set(matches.map(m => m[1]).filter(url => {
+              const lower = url.toLowerCase();
+              return !lower.includes("shields.io") && !lower.includes("badge");
+            }))];
+          }
+
+          async function readIpaInfo(url) {
+            const buffer = await download(url);
+            const zip = new AdmZip(buffer);
+
+            const entry = zip.getEntries().find(e =>
+              /^Payload\/[^/]+\.app\/Info\.plist$/.test(e.entryName)
+            );
+
+            if (!entry) throw new Error("IPA does not contain an app Info.plist");
+
+            const info = plist.parse(entry.getData().toString("utf8"));
+            const primary = info.CFBundleIcons?.CFBundlePrimaryIcon || {};
+
+            let iconFiles = primary.CFBundleIconFiles || [];
+            if (typeof iconFiles === "string") iconFiles = [iconFiles];
+
+            return {
+              bundleIdentifier: info.CFBundleIdentifier || "",
+              iconName: info.CFBundleIconName || primary.CFBundleIconName || "",
+              iconFiles
+            };
+          }
+
+          function iconSize(image) {
+            const match = String(image.size || "").match(/([\d.]+)\s*[x×]\s*([\d.]+)/);
+            if (!match) return 0;
+            return Number(match[1]) * Number(match[2]);
+          }
+
+          async function findIcon(owner, name, branch, ipaInfo) {
+            const repo = `${API}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(name)}`;
+            const treeData = await api(
+              `${repo}/git/trees/${encodeURIComponent(branch)}?recursive=1`
+            );
+
+            const tree = treeData.tree || [];
+            const sets = tree.filter(e =>
+              e.type === "tree" && e.path.toLowerCase().endsWith(".appiconset")
+            );
+
+            let selectedSet = sets.find(e =>
+              path.posix.basename(e.path, ".appiconset").toLowerCase() ===
+              ipaInfo.iconName.toLowerCase()
+            );
+
+            if (selectedSet) {
+              const contentsPath = `${selectedSet.path}/Contents.json`;
+              const contentsData = await api(
+                `${repo}/contents/${contentsPath.split("/").map(encodeURIComponent).join("/")}?ref=${encodeURIComponent(branch)}`
+              );
+
+              const contents = JSON.parse(
+                Buffer.from(contentsData.content, "base64").toString("utf8")
+              );
+
+              const candidates = (contents.images || [])
+                .filter(image =>
+                  image.filename &&
+                  !(image.appearances || []).some(a =>
+                    a.appearance === "luminosity"
+                  )
+                )
+                .sort((a, b) => {
+                  const sizeDifference = iconSize(b) - iconSize(a);
+                  if (sizeDifference) return sizeDifference;
+
+                  const scale = value =>
+                    Number(String(value.scale || "").replace("x", "")) || 0;
+
+                  return scale(b) - scale(a);
+                });
+
+              if (candidates.length) {
+                const file = `${selectedSet.path}/${candidates[0].filename}`;
+                return `https://raw.githubusercontent.com/${owner}/${name}/${encodeURIComponent(branch)}/${file.split("/").map(encodeURIComponent).join("/")}`;
+              }
+            }
+
+            for (const iconFile of ipaInfo.iconFiles || []) {
+              const filename = path.posix.basename(iconFile);
+              const found = tree.find(e =>
+                e.type === "blob" &&
+                path.posix.basename(e.path).toLowerCase() === filename.toLowerCase()
+              );
+
+              if (found) {
+                return `https://raw.githubusercontent.com/${owner}/${name}/${encodeURIComponent(branch)}/${found.path.split("/").map(encodeURIComponent).join("/")}`;
+              }
+            }
+
+            return "";
+          }
+
+          function versionEntry(release, asset) {
+            return {
+              version: versionOf(release),
+              date: dateOf(release),
+              downloadURL: asset.browser_download_url,
+              localizedDescription: (release.body || "").trim(),
+              size: asset.size || 0
+            };
+          }
+
+          function latestDownloadUrl(owner, name, assetName) {
+            return `https://github.com/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/releases/latest/download/${encodeURIComponent(assetName)}`;
+          }
+
+          async function buildApp(owner, name, repository, releases, maxVersions) {
+            const qualifying = validReleases(releases).slice(0, maxVersions);
+            if (!qualifying.length) return null;
+
+            const [latest, latestAsset] = [qualifying[0], ipaAssets(qualifying[0])[0]];
+            const ipaInfo = await readIpaInfo(latestAsset.browser_download_url);
+
+            if (!ipaInfo.bundleIdentifier) {
+              throw new Error("Could not determine bundle identifier from IPA");
+            }
+
+            let readme = "";
+            try {
+              const result = await api(
+                `${API}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/readme`
+              );
+              if (result.encoding === "base64") {
+                readme = Buffer.from(result.content, "base64").toString("utf8");
+              }
+            } catch (error) {
+              console.log(`README unavailable: ${error.message}`);
+            }
+
+            let iconURL = "";
+            try {
+              iconURL = await findIcon(
+                owner,
+                name,
+                repository.default_branch || "main",
+                ipaInfo
+              );
+            } catch (error) {
+              console.log(`Icon lookup failed: ${error.message}`);
+            }
+
+            const versions = qualifying.map(release =>
+              versionEntry(release, ipaAssets(release)[0])
+            );
+
+            const description = (repository.description || "").trim() || name;
+            const localizedDescription = readmeDescription(readme) || description;
+
+            const app = {
+              bundleIdentifier: ipaInfo.bundleIdentifier,
+              name,
+              developerName: owner,
+              iconURL,
+              subtitle: description,
+              localizedDescription,
+              version: versions[0].version,
+              versionDate: versions[0].date,
+              versionDescription: versions[0].localizedDescription,
+              downloadURL: latestDownloadUrl(owner, name, latestAsset.name),
+              size: latestAsset.size || 0,
+              versions
+            };
+
+            const screenshots = readmeImages(readme);
+            if (screenshots.length) app.screenshotURLs = screenshots;
+
+            return {
+              releaseKey: {
+                id: latest.id,
+                tag: latest.tag_name,
+                publishedAt: latest.published_at,
+                createdAt: latest.created_at
+              },
+              app
+            };
+          }
+
+          async function allReleases(owner, name) {
+            const releases = [];
+            for (let page = 1; ; page++) {
+              const data = await api(
+                `${API}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/releases?per_page=100&page=${page}`
+              );
+
+              releases.push(...data);
+              if (data.length < 100) break;
+            }
+            return releases;
+          }
+
+          async function main() {
+            const config = readJson("config.json", null);
+            if (!config) throw new Error("config.json is missing or invalid");
+
+            const output = config.output || OUTPUT;
+            const cache = readJson(CACHE, { repositories: {} });
+            if (!cache.repositories) cache.repositories = {};
+
+            const previousSource = readJson(output, {});
+            const sourceConfig = config.source || {};
+
+            const source = {
+              name: sourceConfig.name,
+              identifier: sourceConfig.identifier,
+              iconURL: sourceConfig.iconURL,
+              apps: [],
+              version: sourceConfig.version ?? 1,
+              apiVersion: sourceConfig.apiVersion ?? "v1"
+            };
+
+            const repositories = config.repositories || [];
+            const maxVersions = Math.max(1, Number(config.max_versions || 50));
+            const currentKeys = new Set(
+              repositories.map(r => repoKey(r.owner, r.name))
+            );
+
+            for (const key of Object.keys(cache.repositories)) {
+              if (!currentKeys.has(key)) delete cache.repositories[key];
+            }
+
+            for (const item of repositories) {
+              const owner = String(item.owner || "").trim();
+              const name = String(item.name || "").trim();
+              if (!owner || !name) continue;
+
+              const key = repoKey(owner, name);
+              const cached = cache.repositories[key];
+
+              console.log(`Checking ${owner}/${name}`);
+
+              try {
+                const repository = await api(
+                  `${API}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(name)}`
+                );
+
+                let latest;
+                try {
+                  latest = await api(
+                    `${API}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/releases/latest`
+                  );
+                } catch (error) {
+                  if (cached?.app) {
+                    console.log(`Latest release unavailable; retaining cache: ${error.message}`);
+                    source.apps.push(cached.app);
+                    continue;
+                  }
+                  throw error;
+                }
+
+                const latestKey = {
+                  id: latest.id,
+                  tag: latest.tag_name,
+                  publishedAt: latest.published_at,
+                  createdAt: latest.created_at
+                };
+
+                const unchanged =
+                  cached?.releaseKey &&
+                  JSON.stringify(cached.releaseKey) === JSON.stringify(latestKey) &&
+                  cached.app &&
+                  Number(cached.maxVersions) === maxVersions;
+
+                if (unchanged) {
+                  console.log("Release unchanged; using cached app.");
+                  source.apps.push(cached.app);
+                  continue;
+                }
+
+                console.log("Release changed or cache missing; rebuilding app.");
+
+                const releases = await allReleases(owner, name);
+                const built = await buildApp(
+                  owner,
+                  name,
+                  repository,
+                  releases,
+                  maxVersions
+                );
+
+                if (built) {
+                  cache.repositories[key] = {
+                    ...built,
+                    maxVersions
+                  };
+                  source.apps.push(built.app);
+                } else if (cached?.app) {
+                  source.apps.push(cached.app);
+                } else {
+                  console.log("No published IPA releases found.");
+                }
+              } catch (error) {
+                console.error(`Failed ${owner}/${name}: ${error.message}`);
+                if (cached?.app) source.apps.push(cached.app);
+              }
+            }
+
+            writeJson(output, source);
+            writeJson(CACHE, cache);
+
+            console.log(`Generated ${output} with ${source.apps.length} app(s).`);
+          }
+
+          main().catch(error => {
+            console.error(error);
+            process.exitCode = 1;
+          });
+          NODE
+
+      - name: Commit changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add frizzlem.json .frizzlem-cache.json
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+          git commit -m "Update AltSource"
+          git push
